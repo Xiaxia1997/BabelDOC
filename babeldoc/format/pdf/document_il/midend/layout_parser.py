@@ -167,6 +167,7 @@ class LayoutParser:
 
                 page.page_layout = page_layouts
                 self._rebuild_toc_layout_as_lines(page, mupdf_doc)
+                self._absorb_orphan_chars_into_text_layouts(page)
                 # self.generate_fallback_line_layout_for_page(page)
                 # self._save_debug_box_to_page(page)
                 progress.advance(1)
@@ -196,6 +197,92 @@ class LayoutParser:
     # 至少这么多行带点号引导线才认为是目录
     TOC_MIN_DOT_LEADER_LINES = 3
     TOC_DOT_LEADER_PATTERN = re.compile(r"\.\s*\.\s*\.")
+
+    # DocLayout-YOLO 的框常盖不满整行文本，框外字符落进 fallback_line，
+    # paragraph_finder 按 layout 分配字符时把一行劈成多个翻译单元：
+    #   fallback "Figure 2: Breakdown" | figure_caption "…Specialized, a" | fallback "nd Structured…"
+    # 结果是一行图注被拆成三段各自翻译、各自排版，拼回去留下空隙且语序错乱。
+    # 这里把紧邻文本 layout 的孤儿字符吸附进来，把框撑满整行。
+    #
+    # 横向吸附的最大间隙 = 该 layout 内字符中位宽 × 这个倍数。
+    # 取 3 是为了跨得过词间空格但跨不过分栏留白。
+    ABSORB_GAP_CHAR_WIDTHS = 3.0
+    # 字符垂直中心必须落在 layout 的 y 范围内（上下各放宽这么多点）
+    ABSORB_Y_TOLERANCE = 2.0
+
+    def _absorb_orphan_chars_into_text_layouts(self, page: il_version_1.Page) -> None:
+        """把紧邻文本 layout 的孤儿字符吸附进来，避免同一行被切成多个翻译单元。"""
+        if not page.pdf_character or not page.page_layout:
+            return
+
+        text_layouts = [
+            layout
+            for layout in page.page_layout
+            if layout.class_name in self.TEXT_CLASS_NAMES
+        ]
+        if not text_layouts:
+            return
+
+        # 孤儿 = 不在任何文本类 layout 内的字符
+        orphans = []
+        for char in page.pdf_character:
+            box = char.visual_bbox.box
+            cx = (box.x + box.x2) / 2
+            cy = (box.y + box.y2) / 2
+            if not any(
+                layout.box.x <= cx <= layout.box.x2
+                and layout.box.y <= cy <= layout.box.y2
+                for layout in text_layouts
+            ):
+                orphans.append(box)
+        if not orphans:
+            return
+
+        absorbed_total = 0
+        for layout in text_layouts:
+            widths = [
+                c.visual_bbox.box.x2 - c.visual_bbox.box.x
+                for c in page.pdf_character
+                if layout.box.x <= (c.visual_bbox.box.x + c.visual_bbox.box.x2) / 2 <= layout.box.x2
+                and layout.box.y <= (c.visual_bbox.box.y + c.visual_bbox.box.y2) / 2 <= layout.box.y2
+            ]
+            if not widths:
+                continue
+            widths.sort()
+            median_w = widths[len(widths) // 2]
+            max_gap = median_w * self.ABSORB_GAP_CHAR_WIDTHS
+
+            # 反复吸附，直到没有新字符能并进来（一次只跨一个间隙）
+            changed = True
+            while changed:
+                changed = False
+                for box in orphans:
+                    cy = (box.y + box.y2) / 2
+                    if not (
+                        layout.box.y - self.ABSORB_Y_TOLERANCE
+                        <= cy
+                        <= layout.box.y2 + self.ABSORB_Y_TOLERANCE
+                    ):
+                        continue
+                    if box.x2 < layout.box.x:
+                        gap = layout.box.x - box.x2
+                        if gap <= max_gap:
+                            layout.box.x = box.x
+                            changed = True
+                            absorbed_total += 1
+                    elif box.x > layout.box.x2:
+                        gap = box.x - layout.box.x2
+                        if gap <= max_gap:
+                            layout.box.x2 = box.x2
+                            changed = True
+                            absorbed_total += 1
+
+        if absorbed_total:
+            logger.info(
+                "Page %s: absorbed %d orphan chars into text layouts",
+                page.page_number,
+                absorbed_total,
+            )
 
     def _is_toc_page(self, page: il_version_1.Page, mupdf_doc: Document) -> bool:
         """判断是否目录页：有 Contents/目录 标题，或多行带点号引导线。"""
