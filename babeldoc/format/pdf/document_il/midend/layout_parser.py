@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -165,6 +166,7 @@ class LayoutParser:
                     page_layouts.append(page_layout)
 
                 page.page_layout = page_layouts
+                self._rebuild_toc_layout_as_lines(page, mupdf_doc)
                 # self.generate_fallback_line_layout_for_page(page)
                 # self._save_debug_box_to_page(page)
                 progress.advance(1)
@@ -174,6 +176,134 @@ class LayoutParser:
                         self.generate_fallback_line_layout_for_page, page, progress
                     )
         return docs
+
+    # 目录页（TOC）的排版结构性太强：每条目一行、点号引导线、右对齐页码。
+    # DocLayout-YOLO 会把多条条目并成一个大文本块，且框常盖不满整行，
+    # 导致同一行被劈进不同 layout（"2 Archite" | "cture"）。
+    # 这里在目录页上用行级 layout 替换文本类 layout，绕开版面模型。
+    # PageLayout 用 class_name（Layout 用 name，两者不通用，不能复用 is_text_layout）
+    TEXT_CLASS_NAMES = frozenset({
+        "plain text", "tiny text", "title", "abandon",
+        "figure_caption", "table_caption", "table_text", "table_footnote",
+        "paragraph_title", "abstract", "content", "figure_title",
+        "table_title", "doc_title", "footnote", "header",
+    })
+
+    TOC_TITLE_PATTERN = re.compile(
+        r"^\s*(contents|table\s+of\s+contents|目\s*录)\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # 至少这么多行带点号引导线才认为是目录
+    TOC_MIN_DOT_LEADER_LINES = 3
+    TOC_DOT_LEADER_PATTERN = re.compile(r"\.\s*\.\s*\.")
+
+    def _is_toc_page(self, page: il_version_1.Page, mupdf_doc: Document) -> bool:
+        """判断是否目录页：有 Contents/目录 标题，或多行带点号引导线。"""
+        try:
+            text = mupdf_doc[page.page_number].get_text("text")
+        except Exception:
+            return False
+        if not text:
+            return False
+
+        head = "\n".join(text.splitlines()[:5])
+        if self.TOC_TITLE_PATTERN.search(head):
+            return True
+
+        dot_lines = sum(
+            1 for line in text.splitlines()
+            if self.TOC_DOT_LEADER_PATTERN.search(line)
+        )
+        return dot_lines >= self.TOC_MIN_DOT_LEADER_LINES
+
+    def _rebuild_toc_layout_as_lines(
+        self, page: il_version_1.Page, mupdf_doc: Document
+    ) -> None:
+        """目录页：把文本类 layout 换成行级 layout，非文本类（图表等）保留。"""
+        if not self._is_toc_page(page, mupdf_doc):
+            return
+
+        char_boxes = babeldoc.format.pdf.document_il.utils.extract_char.convert_page_to_char_boxes(
+            page
+        )
+        if not char_boxes:
+            return
+
+        try:
+            clusters = babeldoc.format.pdf.document_il.utils.extract_char.process_page_chars_to_lines(
+                char_boxes
+            )
+        except Exception as e:
+            logger.warning(
+                "TOC line clustering failed on page %s: %s", page.page_number, e
+            )
+            return
+        if not clusters:
+            return
+
+        text_layouts = [
+            layout
+            for layout in page.page_layout
+            if layout.class_name in self.TEXT_CLASS_NAMES
+        ]
+        kept = [
+            layout
+            for layout in page.page_layout
+            if layout.class_name not in self.TEXT_CLASS_NAMES
+        ]
+
+        line_layouts = []
+        for cluster in clusters:
+            boxes = [c[0] for c in cluster.chars]
+            if not boxes:
+                continue
+            box = il_version_1.Box(
+                min(b.x for b in boxes),
+                min(b.y for b in boxes),
+                max(b.x2 for b in boxes),
+                max(b.y2 for b in boxes),
+            )
+            line_layouts.append(
+                il_version_1.PageLayout(
+                    id=0,  # 稍后统一编号
+                    box=box,
+                    conf=1.0,
+                    class_name=self._dominant_class_name(box, text_layouts),
+                )
+            )
+
+        if not line_layouts:
+            return
+
+        for idx, layout in enumerate(kept + line_layouts, start=1):
+            layout.id = idx
+        page.page_layout = kept + line_layouts
+
+        logger.info(
+            "TOC page %s: replaced %d text layouts with %d line layouts",
+            page.page_number,
+            len(text_layouts),
+            len(line_layouts),
+        )
+
+    @staticmethod
+    def _dominant_class_name(
+        box: il_version_1.Box, text_layouts: list[il_version_1.PageLayout]
+    ) -> str:
+        """取与该行重叠面积最大的原 layout 的类别，没有则退回 plain text。"""
+        best_name = "plain text"
+        best_area = 0.0
+        for layout in text_layouts:
+            lb = layout.box
+            w = min(box.x2, lb.x2) - max(box.x, lb.x)
+            h = min(box.y2, lb.y2) - max(box.y, lb.y)
+            if w <= 0 or h <= 0:
+                continue
+            area = w * h
+            if area > best_area:
+                best_area = area
+                best_name = layout.class_name
+        return best_name
 
     def generate_fallback_line_layout_for_page(self, page: il_version_1.Page, progress):
         try:
