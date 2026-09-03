@@ -167,6 +167,7 @@ class LayoutParser:
 
                 page.page_layout = page_layouts
                 self._rebuild_toc_layout_as_lines(page, mupdf_doc)
+                self._merge_contained_text_layouts(page)
                 self._absorb_orphan_chars_into_text_layouts(page)
                 # self.generate_fallback_line_layout_for_page(page)
                 # self._save_debug_box_to_page(page)
@@ -183,12 +184,26 @@ class LayoutParser:
     # 导致同一行被劈进不同 layout（"2 Archite" | "cture"）。
     # 这里在目录页上用行级 layout 替换文本类 layout，绕开版面模型。
     # PageLayout 用 class_name（Layout 用 name，两者不通用，不能复用 is_text_layout）
-    TEXT_CLASS_NAMES = frozenset({
-        "plain text", "tiny text", "title", "abandon",
-        "figure_caption", "table_caption", "table_text", "table_footnote",
-        "paragraph_title", "abstract", "content", "figure_title",
-        "table_title", "doc_title", "footnote", "header",
-    })
+    TEXT_CLASS_NAMES = frozenset(
+        {
+            "plain text",
+            "tiny text",
+            "title",
+            "abandon",
+            "figure_caption",
+            "table_caption",
+            "table_text",
+            "table_footnote",
+            "paragraph_title",
+            "abstract",
+            "content",
+            "figure_title",
+            "table_title",
+            "doc_title",
+            "footnote",
+            "header",
+        }
+    )
 
     TOC_TITLE_PATTERN = re.compile(
         r"^\s*(contents|table\s+of\s+contents|目\s*录)\s*$",
@@ -209,6 +224,76 @@ class LayoutParser:
     ABSORB_GAP_CHAR_WIDTHS = 3.0
     # 字符垂直中心必须落在 layout 的 y 范围内（上下各放宽这么多点）
     ABSORB_Y_TOLERANCE = 2.0
+
+    @classmethod
+    def _merge_contained_text_layouts(cls, page: il_version_1.Page) -> None:
+        """合并版面模型为同一行生成的嵌套文本框，避免一行被分段翻译。"""
+        layouts = list(page.page_layout)
+        while True:
+            pair = cls._find_contained_text_layout_pair(layouts)
+            if pair is None:
+                break
+            first_index, second_index = pair
+            first, second = layouts[first_index], layouts[second_index]
+            survivor, removed = cls._preferred_layout(first, second)
+            survivor.box = cls._union_box(first.box, second.box)
+            layouts.remove(removed)
+        page.page_layout = layouts
+
+    @classmethod
+    def _find_contained_text_layout_pair(cls, layouts):
+        for first_index, first in enumerate(layouts):
+            for second_index in range(first_index + 1, len(layouts)):
+                second = layouts[second_index]
+                if cls._layouts_describe_same_text_region(first, second):
+                    return first_index, second_index
+        return None
+
+    @classmethod
+    def _layouts_describe_same_text_region(cls, first, second) -> bool:
+        if first.class_name not in cls.TEXT_CLASS_NAMES:
+            return False
+        if second.class_name not in cls.TEXT_CLASS_NAMES:
+            return False
+        if first.class_name != second.class_name and "abandon" not in {
+            first.class_name,
+            second.class_name,
+        }:
+            return False
+        intersection = cls._intersection_area(first.box, second.box)
+        smaller = min(cls._box_area(first.box), cls._box_area(second.box))
+        return smaller > 0 and intersection / smaller >= 0.9
+
+    @staticmethod
+    def _preferred_layout(first, second):
+        if first.class_name == "abandon" and second.class_name != "abandon":
+            return second, first
+        if second.class_name == "abandon" and first.class_name != "abandon":
+            return first, second
+        return (
+            (first, second)
+            if (first.conf or 0) >= (second.conf or 0)
+            else (second, first)
+        )
+
+    @staticmethod
+    def _box_area(box) -> float:
+        return max(0.0, box.x2 - box.x) * max(0.0, box.y2 - box.y)
+
+    @staticmethod
+    def _intersection_area(first, second) -> float:
+        width = max(0.0, min(first.x2, second.x2) - max(first.x, second.x))
+        height = max(0.0, min(first.y2, second.y2) - max(first.y, second.y))
+        return width * height
+
+    @staticmethod
+    def _union_box(first, second):
+        return il_version_1.Box(
+            min(first.x, second.x),
+            min(first.y, second.y),
+            max(first.x2, second.x2),
+            max(first.y2, second.y2),
+        )
 
     def _absorb_orphan_chars_into_text_layouts(self, page: il_version_1.Page) -> None:
         """把紧邻文本 layout 的孤儿字符吸附进来，避免同一行被切成多个翻译单元。"""
@@ -243,8 +328,12 @@ class LayoutParser:
             widths = [
                 c.visual_bbox.box.x2 - c.visual_bbox.box.x
                 for c in page.pdf_character
-                if layout.box.x <= (c.visual_bbox.box.x + c.visual_bbox.box.x2) / 2 <= layout.box.x2
-                and layout.box.y <= (c.visual_bbox.box.y + c.visual_bbox.box.y2) / 2 <= layout.box.y2
+                if layout.box.x
+                <= (c.visual_bbox.box.x + c.visual_bbox.box.x2) / 2
+                <= layout.box.x2
+                and layout.box.y
+                <= (c.visual_bbox.box.y + c.visual_bbox.box.y2) / 2
+                <= layout.box.y2
             ]
             if not widths:
                 continue
@@ -257,6 +346,22 @@ class LayoutParser:
             while changed:
                 changed = False
                 for box in orphans:
+                    cx = (box.x + box.x2) / 2
+                    if layout.box.x <= cx <= layout.box.x2:
+                        if box.y2 < layout.box.y:
+                            gap = layout.box.y - box.y2
+                            if gap <= self.ABSORB_Y_TOLERANCE:
+                                layout.box.y = box.y
+                                changed = True
+                                absorbed_total += 1
+                        elif box.y > layout.box.y2:
+                            gap = box.y - layout.box.y2
+                            if gap <= self.ABSORB_Y_TOLERANCE:
+                                layout.box.y2 = box.y2
+                                changed = True
+                                absorbed_total += 1
+                        continue
+
                     cy = (box.y + box.y2) / 2
                     if not (
                         layout.box.y - self.ABSORB_Y_TOLERANCE
@@ -298,8 +403,7 @@ class LayoutParser:
             return True
 
         dot_lines = sum(
-            1 for line in text.splitlines()
-            if self.TOC_DOT_LEADER_PATTERN.search(line)
+            1 for line in text.splitlines() if self.TOC_DOT_LEADER_PATTERN.search(line)
         )
         return dot_lines >= self.TOC_MIN_DOT_LEADER_LINES
 

@@ -1,6 +1,7 @@
 import logging
 import random
 import re
+from dataclasses import replace
 
 import numpy as np
 
@@ -274,11 +275,16 @@ class ParagraphFinder:
                 current_formula_font_ids = page_level_formula_font_ids
             self._split_paragraph_into_lines(paragraph, current_formula_font_ids)
 
+        paragraphs = self._split_graphic_bullet_paragraphs(page, paragraphs)
+        page.pdf_paragraph = paragraphs
+
         # 第三步：处理段落中的空格
         for paragraph in paragraphs:
             add_space_dummy_chars(paragraph)
             self.process_paragraph_spacing(paragraph)
             self.update_paragraph_data(paragraph)
+
+        self._remove_inline_text_backgrounds(page)
 
         # 第四步：计算所有行宽度的中位数
         median_width = self.calculate_median_line_width(paragraphs)
@@ -308,6 +314,123 @@ class ParagraphFinder:
 
         # 新阶段：设置段落的 renderorder 为所有组成部分中 renderorder 最小的
         self._set_paragraph_render_order(page)
+
+    def _split_graphic_bullet_paragraphs(self, page, paragraphs):
+        """按绘制型 bullet 拆段，避免多条列表项作为一个段落送翻译。"""
+        result = []
+        for paragraph in paragraphs:
+            compositions = paragraph.pdf_paragraph_composition or []
+            starts = [
+                index
+                for index, composition in enumerate(compositions)
+                if composition.pdf_line
+                and self._line_has_graphic_bullet(page, composition.pdf_line)
+            ]
+            if len(starts) < 2:
+                result.append(paragraph)
+                continue
+            boundaries = ([0] if starts[0] else []) + starts + [len(compositions)]
+            for start, end in zip(boundaries, boundaries[1:], strict=False):
+                if start == end:
+                    continue
+                item = replace(
+                    paragraph,
+                    pdf_paragraph_composition=list(compositions[start:end]),
+                    debug_id=generate_base58_id(),
+                )
+                self.update_paragraph_data(item, update_unicode=True)
+                result.append(item)
+        return result
+
+    @staticmethod
+    def _line_has_graphic_bullet(page, line) -> bool:
+        box = line.box
+        if not box:
+            return False
+        height = box.y2 - box.y
+        for curve in page.pdf_curve:
+            curve_box = curve.box
+            if not curve.fill_background or not curve_box:
+                continue
+            if (
+                max(curve_box.x2 - curve_box.x, curve_box.y2 - curve_box.y)
+                > height * 0.75
+            ):
+                continue
+            center_y = (curve_box.y + curve_box.y2) / 2
+            gap = box.x - curve_box.x2
+            if box.y - height * 0.25 <= center_y <= box.y2 + height * 0.25:
+                if 0 <= gap <= height * 2:
+                    return True
+        return False
+
+    def _remove_inline_text_backgrounds(self, page) -> None:
+        """移除不会随译文重排的行内背景及边框，保留 bullet 和大块底色。"""
+        lines = [
+            composition.pdf_line
+            for paragraph in page.pdf_paragraph
+            for composition in paragraph.pdf_paragraph_composition or []
+            if composition.pdf_line
+        ]
+        anchors = [
+            curve
+            for curve in page.pdf_curve
+            if curve.fill_background and self._is_inline_decoration(curve, lines)
+        ]
+        if not anchors:
+            return
+        page.pdf_curve = [
+            curve
+            for curve in page.pdf_curve
+            if not any(self._same_decoration(curve, anchor) for anchor in anchors)
+        ]
+
+    @classmethod
+    def _is_inline_decoration(cls, curve, lines) -> bool:
+        if not curve.box:
+            return False
+        for line in lines:
+            if not line.box or cls._line_contains_formula_at_curve(line, curve.box):
+                continue
+            line_height = line.box.y2 - line.box.y
+            curve_height = curve.box.y2 - curve.box.y
+            if not line_height * 0.5 <= curve_height <= line_height * 1.7:
+                continue
+            intersection = cls._box_intersection_area(curve.box, line.box)
+            curve_area = cls._box_area(curve.box)
+            if curve_area and intersection / curve_area >= 0.5:
+                return True
+        return False
+
+    @classmethod
+    def _line_contains_formula_at_curve(cls, line, curve_box) -> bool:
+        return any(
+            char.formula_layout_id
+            and cls._box_intersection_area(char.visual_bbox.box, curve_box) > 0
+            for char in line.pdf_character
+        )
+
+    @classmethod
+    def _same_decoration(cls, curve, anchor) -> bool:
+        if not curve.box or not anchor.box:
+            return False
+        curve_height = curve.box.y2 - curve.box.y
+        anchor_height = anchor.box.y2 - anchor.box.y
+        if min(curve_height, anchor_height) / max(curve_height, anchor_height) < 0.8:
+            return False
+        intersection = cls._box_intersection_area(curve.box, anchor.box)
+        smaller = min(cls._box_area(curve.box), cls._box_area(anchor.box))
+        return smaller > 0 and intersection / smaller >= 0.8
+
+    @staticmethod
+    def _box_area(box) -> float:
+        return max(0.0, box.x2 - box.x) * max(0.0, box.y2 - box.y)
+
+    @staticmethod
+    def _box_intersection_area(first, second) -> float:
+        width = max(0.0, min(first.x2, second.x2) - max(first.x, second.x))
+        height = max(0.0, min(first.y2, second.y2) - max(first.y, second.y))
+        return width * height
 
     def _set_paragraph_render_order(self, page: Page):
         """
