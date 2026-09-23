@@ -739,6 +739,11 @@ def migrate_toc(
     if translation_config.use_alternating_pages_dual:
         logger.info('skipping TOC migration for "use_alternating_pages_dual" mode')
         return
+    if translation_config.only_include_translated_page:
+        # Partial output has different page numbers, so the original bookmarks
+        # would point to the wrong pages. Callers can retain them when merging.
+        logger.info("Skipping TOC migration for translated-page-only output")
+        return
     old_doc = Document(translation_config.input_file)
     if not old_doc:
         return
@@ -753,15 +758,6 @@ def migrate_toc(
     if not toc_data:
         logger.info("No TOC found in the original PDF, skipping migration.")
         return
-
-    if translation_config.only_include_translated_page:
-        total_page = set(range(0, len(old_doc)))
-
-        pages_to_translate = {
-            i for i in len(old_doc) if translation_config.should_translate_page(i + 1)
-        }
-
-        should_removed_page = list(total_page - pages_to_translate)
 
     files = {
         translate_result.dual_pdf_path,
