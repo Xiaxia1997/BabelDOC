@@ -1,6 +1,7 @@
 from babeldoc.format.pdf.document_il import il_version_1
 from babeldoc.format.pdf.document_il.midend.layout_parser import LayoutParser
 from babeldoc.format.pdf.document_il.midend.paragraph_finder import ParagraphFinder
+from babeldoc.format.pdf.document_il.utils.layout_helper import build_layout_index
 
 
 def _box(x: float, y: float, x2: float, y2: float) -> il_version_1.Box:
@@ -133,3 +134,41 @@ def test_inline_text_background_is_removed_but_bullet_and_banner_are_kept():
     finder._remove_inline_text_backgrounds(page)
 
     assert page.pdf_curve == [bullet, banner]
+
+
+def test_figure_labels_stay_original_while_caption_table_and_prose_translate():
+    layouts = [
+        ("figure", _box(10, 10, 100, 100)),
+        ("fallback_line", _box(20, 20, 90, 30)),
+        ("table", _box(70, 40, 140, 90)),
+        ("table_text", _box(80, 50, 130, 60)),
+        ("figure_caption", _box(10, 90, 140, 110)),
+        ("plain text", _box(10, 130, 140, 145)),
+    ]
+    page = il_version_1.Page(
+        page_layout=[
+            il_version_1.PageLayout(id=i, conf=0.9, class_name=name, box=box)
+            for i, (name, box) in enumerate(layouts, start=1)
+        ],
+        pdf_character=[
+            _char("F", _box(25, 21, 30, 29)),
+            _char("T", _box(85, 51, 90, 59)),
+            _char("C", _box(25, 95, 30, 103)),
+            _char("B", _box(25, 131, 30, 139)),
+        ],
+    )
+    finder = ParagraphFinder.__new__(ParagraphFinder)
+    layout_index, layout_map = build_layout_index(page)
+
+    paragraphs = finder._group_characters_into_paragraphs(
+        page, layout_index, layout_map
+    )
+
+    assert [
+        "".join(
+            item.pdf_character.char_unicode
+            for item in paragraph.pdf_paragraph_composition
+        )
+        for paragraph in paragraphs
+    ] == ["T", "C", "B"]
+    assert [char.char_unicode for char in page.pdf_character] == ["F"]

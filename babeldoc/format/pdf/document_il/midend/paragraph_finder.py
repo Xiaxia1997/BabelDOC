@@ -14,6 +14,10 @@ from babeldoc.format.pdf.document_il import PdfLine
 from babeldoc.format.pdf.document_il import PdfParagraph
 from babeldoc.format.pdf.document_il import PdfParagraphComposition
 from babeldoc.format.pdf.document_il import PdfRectangle
+from babeldoc.format.pdf.document_il.midend.figure_text_protection import (
+    figure_text_regions,
+)
+from babeldoc.format.pdf.document_il.midend.figure_text_protection import is_figure_text
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.utils.formular_helper import (
     collect_page_formula_font_ids,
@@ -566,13 +570,19 @@ class ParagraphFinder:
         current_paragraph: PdfParagraph | None = None
         current_layout: Layout | None = None
         skip_chars = []
+        figure_boxes, translatable_boxes = figure_text_regions(page)
 
         for char in page.pdf_character:
-            char_layout = get_character_layout(char, layout_index, layout_map)
             # Check if character is in any formula layout and set formula_layout_id
             char.formula_layout_id = is_character_in_formula_layout(
                 char, page, layout_index, layout_map
             )
+            if is_figure_text(char, figure_boxes, translatable_boxes):
+                skip_chars.append(char)
+                current_paragraph = None
+                current_layout = None
+                continue
+            char_layout = get_character_layout(char, layout_index, layout_map)
 
             if not is_text_layout(char_layout) or self.is_isolated_formula(char):
                 skip_chars.append(char)
